@@ -1,7 +1,6 @@
 package com.apollographql.apollo3.compiler.backend.ast
 
 import com.apollographql.apollo3.api.Operation
-import com.apollographql.apollo3.compiler.applyIf
 import com.apollographql.apollo3.compiler.backend.ir.BackendIr
 import com.apollographql.apollo3.compiler.backend.ir.SelectionKey
 import com.apollographql.apollo3.compiler.introspection.IntrospectionSchema
@@ -16,6 +15,7 @@ internal class AstBuilder private constructor(
     private val typesPackageName: String,
     private val fragmentsPackage: String,
     private val operationOutput: OperationOutput,
+    private val generateFragmentsAsInterfaces: Boolean,
 ) {
 
   companion object {
@@ -25,6 +25,7 @@ internal class AstBuilder private constructor(
         typesPackageName: String,
         fragmentsPackage: String,
         operationOutput: OperationOutput,
+        generateFragmentsAsInterfaces: Boolean,
     ): CodeGenerationAst {
       return AstBuilder(
           backendIr = this,
@@ -33,6 +34,7 @@ internal class AstBuilder private constructor(
           typesPackageName = typesPackageName,
           fragmentsPackage = fragmentsPackage,
           operationOutput = operationOutput,
+          generateFragmentsAsInterfaces = generateFragmentsAsInterfaces,
       ).build()
     }
   }
@@ -158,6 +160,7 @@ internal class AstBuilder private constructor(
           typeRef = CodeGenerationAst.TypeRef(
               name = this.name!!.toUpperCamelCase(),
               packageName = typesPackageName,
+              isNamedFragmentDataRef = false,
           ),
           schemaTypeName = name
       )
@@ -182,8 +185,10 @@ internal class AstBuilder private constructor(
                     packageName = typesPackageName,
                     enclosingType = CodeGenerationAst.TypeRef(
                         packageName = typesPackageName,
-                        name = "CustomScalars"
-                    )
+                        name = "CustomScalars",
+                        isNamedFragmentDataRef = false,
+                    ),
+                    isNamedFragmentDataRef = false,
                 )
             )
           }
@@ -207,6 +212,7 @@ internal class AstBuilder private constructor(
             typeRef = CodeGenerationAst.TypeRef(
                 name = this.name!!.toUpperCamelCase(),
                 packageName = typesPackageName,
+                isNamedFragmentDataRef = false,
             ),
             schemaTypeName = this.name
         )
@@ -244,8 +250,10 @@ internal class AstBuilder private constructor(
               name = "Data",
               enclosingType = CodeGenerationAst.TypeRef(
                   name = operationType.name.toLowerCase().capitalize(),
-                  packageName = Operation::class.java.`package`.name
-              )
+                  packageName = Operation::class.java.`package`.name,
+                  isNamedFragmentDataRef = false,
+              ),
+              isNamedFragmentDataRef = false,
           )
       )
     }
@@ -305,6 +313,7 @@ internal class AstBuilder private constructor(
     val implementationTypeRef = CodeGenerationAst.TypeRef(
         name = this.implementationSelectionSet.name.toUpperCamelCase(),
         packageName = fragmentsPackage,
+        isNamedFragmentDataRef = true
     )
     return CodeGenerationAst.FragmentType(
         description = this.comment,
@@ -321,6 +330,7 @@ internal class AstBuilder private constructor(
             typeRef = implementationTypeRef,
             schemaTypename = null,
             fragmentAccessors = emptyList(),
+            abstract = false
         ),
         fragmentDefinition = this.source,
         variables = this.variables.map { it.toAst() },
@@ -419,10 +429,14 @@ internal class AstBuilder private constructor(
     }
 
     val currentObjectTypeRef = currentSelectionKey.asTypeRef(targetPackageName)
-    val implements = alternativeSelectionKeys
-        .map { keys -> keys.asTypeRef(targetPackageName) }
-        .filterNot { it == currentObjectTypeRef }
-        .toSet()
+
+    // for fragments as data classes we don't use any inheritance
+    val implements = if (generateFragmentsAsInterfaces) {
+      alternativeSelectionKeys
+          .map { keys -> keys.asTypeRef(targetPackageName) }
+          .filterNot { it == currentObjectTypeRef }
+          .toSet()
+    } else emptySet()
 
     val kind = CodeGenerationAst.ObjectType.Kind.Interface.takeIf { abstract } ?: CodeGenerationAst.ObjectType.Kind.Object
     val nestedObjects = fields
@@ -445,7 +459,8 @@ internal class AstBuilder private constructor(
         nestedObjects = nestedObjects,
         schemaTypename = schemaTypename,
         fragmentAccessors = emptyList(),
-        isTypeCase = isTypeCase
+        isTypeCase = isTypeCase,
+        abstract = abstract
     )
   }
 
@@ -460,16 +475,26 @@ internal class AstBuilder private constructor(
       selectionKey: SelectionKey,
       alternativeSelectionKeys: Set<SelectionKey>,
   ): CodeGenerationAst.ObjectType {
-    val possibleImplementations = if (abstract) emptyMap() else fragments
-        .filter { fragment -> fragment.type == BackendIr.Fragment.Type.Implementation }
-        .flatMap { fragment ->
-          val typeRef = (selectionKey + fragment.name).asTypeRef(targetPackageName)
-          fragment.possibleTypes.map { possibleType -> possibleType.name!! to typeRef }
+    val possibleImplementations = if (abstract) emptyList() else fragments
+        .filter { fragment ->
+          fragment.type == BackendIr.Fragment.Type.Implementation ||
+              fragment.type is BackendIr.Fragment.Type.Delegate
         }
-        .toMap()
+        .map { fragment ->
+          val typeRef = if (fragment.type is BackendIr.Fragment.Type.Delegate) {
+            fragment.type.fragmentSelectionKey.asTypeRef(fragmentsPackage)
+          } else {
+            (selectionKey + fragment.name).asTypeRef(targetPackageName)
+          }
+          CodeGenerationAst.ObjectType.FragmentImplementation(
+              typeConditions = fragment.possibleTypes.mapNotNull { it.name },
+              typeRef = typeRef
+          )
+        }
 
-    val kind = CodeGenerationAst.ObjectType.Kind.Fragment(
-        defaultImplementation = (selectionKey + "Other${parentTypeName.toUpperCamelCase()}").asTypeRef(targetPackageName),
+    val kind = CodeGenerationAst.ObjectType.Kind.ObjectWithFragments(
+        defaultImplementation = fragments.find { fragment -> fragment.type is BackendIr.Fragment.Type.Fallback }
+            ?.let { fallbackFragment -> (selectionKey + fallbackFragment.name).asTypeRef(targetPackageName) },
         possibleImplementations = possibleImplementations,
     )
     val astFields = fields.map { field ->
@@ -480,18 +505,23 @@ internal class AstBuilder private constructor(
     }
 
     val currentObjectTypeRef = selectionKey.asTypeRef(targetPackageName)
-    val implements = alternativeSelectionKeys
-        .map { keys -> keys.asTypeRef(targetPackageName) }
-        .filterNot { it == currentObjectTypeRef }
-        .toSet()
+
+    // for fragments as data classes we don't use any inheritance
+    val implements = if (generateFragmentsAsInterfaces) {
+      alternativeSelectionKeys
+          .map { keys -> keys.asTypeRef(targetPackageName) }
+          .filterNot { it == currentObjectTypeRef }
+          .toSet()
+    } else emptySet()
 
     val nestedObjects = buildFragmentNestedObjectTypes(
-        fragments = fragments,
+        fragments = fragments.filter { fragment -> fragment.type !is BackendIr.Fragment.Type.Delegate },
         abstract = abstract,
         fields = fields,
         targetPackageName = targetPackageName,
         selectionKey = selectionKey,
     )
+
     val objectTypeRef = selectionKey.asTypeRef(targetPackageName)
     val fragmentAccessors = fragments.accessors
         .map { (name, selectionKey) ->
@@ -512,7 +542,8 @@ internal class AstBuilder private constructor(
         nestedObjects = nestedObjects,
         schemaTypename = schemaTypename,
         fragmentAccessors = fragmentAccessors,
-        isTypeCase = false
+        isTypeCase = false,
+        abstract = generateFragmentsAsInterfaces
     )
   }
 
@@ -536,7 +567,7 @@ internal class AstBuilder private constructor(
         .map { field ->
           field.asAstObjectType(
               targetPackageName = targetPackageName,
-              abstract = abstract || fragmentObjectTypes.isNotEmpty(),
+              abstract = abstract || (generateFragmentsAsInterfaces && fragmentObjectTypes.isNotEmpty()),
               currentSelectionKey = selectionKey + field.typeName,
           )
         }
@@ -607,7 +638,7 @@ internal class AstBuilder private constructor(
         deprecationReason = this.deprecationReason,
         arguments = this.args.associate { argument -> argument.name to argument.value },
         conditions = this.condition.toAst().toSet(),
-        override = this.selectionKeys.any { key -> key != selectionKey }
+        override = generateFragmentsAsInterfaces && this.selectionKeys.any { key -> key != selectionKey }
     )
   }
 
@@ -639,7 +670,8 @@ internal class AstBuilder private constructor(
           nullable = true,
           typeRef = CodeGenerationAst.TypeRef(
               name = schemaTypeRef.name!!.toUpperCamelCase(),
-              packageName = typesPackageName
+              packageName = typesPackageName,
+              isNamedFragmentDataRef = false,
           ),
           schemaTypeName = schemaTypeRef.name
       )
@@ -674,8 +706,10 @@ internal class AstBuilder private constructor(
                     packageName = typesPackageName,
                     enclosingType = CodeGenerationAst.TypeRef(
                         packageName = typesPackageName,
-                        name = "CustomScalars"
-                    )
+                        name = "CustomScalars",
+                        isNamedFragmentDataRef = false,
+                    ),
+                    isNamedFragmentDataRef = false,
                 )
             )
           }
@@ -714,13 +748,15 @@ internal class AstBuilder private constructor(
     val rootTypeRef = CodeGenerationAst.TypeRef(
         name = this.keys.first().toUpperCamelCase(),
         packageName = packageName,
-        enclosingType = null
+        enclosingType = null,
+        isNamedFragmentDataRef = this.type == SelectionKey.Type.Fragment && this.keys.size == 2 && this.keys.last() == "Data"
     )
     return this.keys.drop(1).fold(rootTypeRef) { enclosingType, key ->
       CodeGenerationAst.TypeRef(
           name = key.toUpperCamelCase(),
           packageName = packageName,
-          enclosingType = enclosingType
+          enclosingType = enclosingType,
+          isNamedFragmentDataRef = this.type == SelectionKey.Type.Fragment && this.keys.size == 2 && this.keys.last() == "Data"
       )
     }
   }
