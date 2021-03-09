@@ -1,0 +1,223 @@
+package com.apollographql.apollo3.compiler.incubating
+
+import com.apollographql.apollo3.compiler.frontend.GQLArgument
+import com.apollographql.apollo3.compiler.frontend.GQLBooleanValue
+import com.apollographql.apollo3.compiler.frontend.GQLEnumTypeDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLEnumValue
+import com.apollographql.apollo3.compiler.frontend.GQLField
+import com.apollographql.apollo3.compiler.frontend.GQLFieldDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLFloatValue
+import com.apollographql.apollo3.compiler.frontend.GQLFragmentDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLFragmentSpread
+import com.apollographql.apollo3.compiler.frontend.GQLInlineFragment
+import com.apollographql.apollo3.compiler.frontend.GQLInputObjectTypeDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLIntValue
+import com.apollographql.apollo3.compiler.frontend.GQLInterfaceTypeDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLListType
+import com.apollographql.apollo3.compiler.frontend.GQLListValue
+import com.apollographql.apollo3.compiler.frontend.GQLNamedType
+import com.apollographql.apollo3.compiler.frontend.GQLNonNullType
+import com.apollographql.apollo3.compiler.frontend.GQLNullValue
+import com.apollographql.apollo3.compiler.frontend.GQLObjectTypeDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLObjectValue
+import com.apollographql.apollo3.compiler.frontend.GQLOperationDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLScalarTypeDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLSelection
+import com.apollographql.apollo3.compiler.frontend.GQLSelectionSet
+import com.apollographql.apollo3.compiler.frontend.GQLStringValue
+import com.apollographql.apollo3.compiler.frontend.GQLType
+import com.apollographql.apollo3.compiler.frontend.GQLUnionTypeDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLValue
+import com.apollographql.apollo3.compiler.frontend.GQLVariableDefinition
+import com.apollographql.apollo3.compiler.frontend.GQLVariableValue
+import com.apollographql.apollo3.compiler.frontend.Schema
+import com.apollographql.apollo3.compiler.frontend.definitionFromScope
+import com.apollographql.apollo3.compiler.frontend.findDeprecationReason
+import com.apollographql.apollo3.compiler.frontend.inferVariables
+import com.apollographql.apollo3.compiler.frontend.leafType
+import com.apollographql.apollo3.compiler.frontend.rootTypeDefinition
+import com.apollographql.apollo3.compiler.frontend.toUtf8WithIndents
+import com.apollographql.apollo3.compiler.frontend.usedFragmentNames
+
+
+class IRBuilder(
+    private val schema: Schema,
+    private val operationDefinitions: List<GQLOperationDefinition>,
+    private val metadataFragmentDefinitions: List<GQLFragmentDefinition>,
+    private val fragmentDefinitions: List<GQLFragmentDefinition>
+) {
+  private val allGQLFragmentDefinitions = (metadataFragmentDefinitions + fragmentDefinitions).associateBy { it.name }
+
+  private val namedFragmentDefinitions = mutableMapOf<String, Fragment>()
+
+  internal fun build(): IR {
+    return IR(
+        operations = operationDefinitions.map { it.toIr() },
+        fragments = fragmentDefinitions.map {
+          val definition = namedFragmentDefinitions[it.name]
+          if (definition == null) {
+            println("Unused fragment '${it.name}'?")
+            it.toIr()
+          } else {
+            definition
+          }
+        }
+    )
+  }
+
+  private fun getNamedFragmentDefinition(name: String): Fragment {
+    if (namedFragmentDefinitions[name] != null) {
+      return namedFragmentDefinitions[name]!!
+    }
+
+    val gqlFragmentDefinition = allGQLFragmentDefinitions[name] ?: error("Cannot find fragment '$name'")
+
+    return gqlFragmentDefinition.toIr().also {
+      namedFragmentDefinitions[name] = it
+    }
+  }
+
+  private fun firOperationType(operationType: String) = OperationType.valueOf(operationType.capitalize())
+
+  private fun GQLFragmentDefinition.toIr(): Fragment {
+    val variables = inferVariables(selectionSet, schema.typeDefinition(typeCondition.name), schema, allGQLFragmentDefinitions)
+    return Fragment(
+        name = name,
+        description = description,
+        typeCondition = typeCondition.name,
+        source = toUtf8WithIndents(),
+        selectionSet = selectionSet.toIr(typeCondition.name, BooleanExpression.True),
+        variables = variables.map {
+          Variable(name = it.key, type = it.value.toIr(), defaultValue = null)
+        }
+    )
+  }
+
+  private fun GQLOperationDefinition.toIr(): Operation {
+    val typeDefinition = rootTypeDefinition(schema)
+        ?: throw IllegalStateException("ApolloGraphql: cannot find root type for '$operationType'")
+
+    val fragmentNames = usedFragmentNames(schema, allGQLFragmentDefinitions)
+
+    return Operation(
+        name = name ?: throw IllegalStateException("Apollo doesn't support anonymous operation."),
+        operationType = firOperationType(operationType),
+        typeCondition = typeDefinition.name,
+        variables = variableDefinitions.map { it.toIr() },
+        selectionSet = selectionSet.toIr(typeDefinition.name, BooleanExpression.True).let {
+          FirMerger.mergeSelectionSet(it, typeDefinition.name)
+        },
+        description = description,
+        sourceWithFragments = (toUtf8WithIndents() + "\n" + fragmentNames.joinToString(
+            separator = "\n"
+        ) { fragmentName ->
+          allGQLFragmentDefinitions[fragmentName]!!.toUtf8WithIndents()
+        }).trimEnd('\n'),
+    )
+  }
+
+  private fun GQLVariableDefinition.toIr(): Variable {
+    return Variable(
+        name = name,
+        defaultValue = defaultValue?.validateAndCoerce(type, schema, null)?.orThrow()?.toIr(),
+        type = type.toIr(),
+    )
+  }
+
+  private fun GQLType.toIr(): Type {
+    return when (this) {
+      is GQLNonNullType -> NonNullType(ofType = type.toIr())
+      is GQLListType -> ListType(ofType = type.toIr())
+      is GQLNamedType -> when (schema.typeDefinition(name)) {
+        is GQLScalarTypeDefinition -> {
+          when (name) {
+            "String" -> StringType
+            "Boolean" -> BooleanType
+            "Int" -> IntType
+            "Float" -> FloatType
+            "ID" -> IDType
+            else -> CustomScalarType(name)
+          }
+        }
+        is GQLEnumTypeDefinition -> EnumType(name)
+        is GQLObjectTypeDefinition -> ObjectType(name)
+        is GQLInterfaceTypeDefinition -> InterfaceType(name)
+        is GQLUnionTypeDefinition -> UnionType(name)
+        is GQLInputObjectTypeDefinition -> InputObjectType(name)
+      }
+    }
+  }
+
+  private fun GQLValue.toIr(): Value {
+    return when (this) {
+      is GQLIntValue -> IntValue(value = value)
+      is GQLStringValue -> StringValue(value = value)
+      is GQLFloatValue -> FloatValue(value = value)
+      is GQLBooleanValue -> BooleanValue(value = value)
+      is GQLEnumValue -> EnumValue(value = value)
+      is GQLNullValue -> NullValue
+      is GQLVariableValue -> VariableValue(name = name)
+      is GQLListValue -> ListValue(values = values.map { it.toIr() })
+      is GQLObjectValue -> ObjectValue(fields = fields.map {
+        ObjectValueField(name = it.name, value = it.value.toIr())
+      })
+    }
+  }
+
+  private fun GQLSelectionSet.toIr(parentType: String, parentCondition: BooleanExpression): SelectionSet {
+    return SelectionSet(
+        selections = selections.map { gqlSelection ->
+          gqlSelection.toIr(parentType, parentCondition)
+        }
+    )
+  }
+
+  /**
+   * Traverse the tree and applies field/inline fragments conditions to sub-fields
+   */
+  private fun GQLSelection.toIr(parentType: String, parentCondition: BooleanExpression): Selection {
+    return when (this) {
+      is GQLField -> {
+        val fieldDefinition = definitionFromScope(schema, schema.typeDefinition(parentType))!!
+        val selfCondition = parentCondition.and(directives.toBooleanExpression()).simplify()
+        Field(
+            name = name,
+            alias = alias,
+            description = fieldDefinition.description,
+            deprecationReason = fieldDefinition.directives.findDeprecationReason(),
+            arguments = arguments?.arguments?.map { it.toIr(fieldDefinition) } ?: emptyList(),
+            condition = selfCondition,
+            selectionSet = selectionSet?.toIr(fieldDefinition.type.leafType().name, selfCondition) ?: SelectionSet(emptyList()),
+            type = fieldDefinition.type.toIr()
+        )
+      }
+      is GQLInlineFragment -> {
+        val selfCondition = parentCondition.and(directives.toBooleanExpression()).simplify()
+        InlineFragment(
+            typeCondition = typeCondition.name,
+            selectionSet = selectionSet.toIr(typeCondition.name, selfCondition)
+        )
+      }
+      is GQLFragmentSpread -> {
+        val selfCondition = parentCondition.and(directives.toBooleanExpression()).simplify()
+        val namedFragmentDefinition = getNamedFragmentDefinition(name)
+        FragmentSpread(
+            name = name,
+            condition = selfCondition,
+            typeCondition = namedFragmentDefinition.typeCondition,
+            selectionSet = namedFragmentDefinition.selectionSet
+        )
+      }
+    }
+  }
+
+  private fun GQLArgument.toIr(fieldDefinition: GQLFieldDefinition): Argument {
+    val inputValueDefinition = fieldDefinition.arguments.first { it.name == name }
+    return Argument(
+        name = name,
+        value = value.toIr(),
+        defaultValue = inputValueDefinition.defaultValue?.toIr(),
+        type = inputValueDefinition.type.toIr()
+    )
+  }
+}

@@ -15,3 +15,21 @@ query TestQuery {
     }
   }
 }
+
+{
+  field1 {
+    field11 {
+      field12 {
+        field13
+      }
+    }
+  }
+  ... on SubType {
+    field11 {
+      field12 {
+        field13
+        field24
+      }
+    }
+  }
+}

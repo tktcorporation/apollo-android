@@ -236,10 +236,11 @@ class CodegenTest(private val folder: File, private val fragmentsCodegenMode: Fr
              * ./gradlew :apollo-compiler:test -DcodegenTests="fragments_with_type_condition" --tests '*Codegen*'
              */
             file.isDirectory && (filterRegex == null || filterRegex.matchEntire(file.name) != null)
+            file.name.contains("frgament")
           }
           .flatMap { file ->
             val queryFile = checkNotNull(file.walk().find { it.extension == "graphql" })
-            val hasFragments = queryFile.readText().contains("fragment\\s\\w*\\son\\s\\w*".toRegex())
+            val hasFragments = true//queryFile.readText().contains("fragment\\s\\w*\\son\\s\\w*".toRegex())
             if (hasFragments) {
               if (fragmentsCodegenMode == null) {
                 listOf(
